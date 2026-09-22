@@ -1702,6 +1702,47 @@ class PTFCA:
         X, Y = self._select_classes(X, Y, [c0, c1])
         return X, Y
 
+    @staticmethod
+    def _normalize_mc_mode(mc_mode):
+        mc_mode = mc_mode.lower()
+        if mc_mode not in ["ovo", "ovr"]:
+            raise ValueError(f"Unsupported multiclass mode: {mc_mode}")
+        return mc_mode
+
+    def _get_class_list(self, Y, class_list=None):
+        if class_list is None:
+            max_cls = int(max(Y) + 1)
+            class_list = list(range(max_cls))
+        return list(class_list)
+
+    def _get_multiclass_tasks(self, class_list, mc_mode="ovo"):
+        mc_mode = self._normalize_mc_mode(mc_mode)
+        if mc_mode == "ovo":
+            return [("ovo", (c0, c1)) for c0, c1 in itertools.combinations(class_list, 2)]
+        return [("ovr", cc) for cc in class_list]
+
+    @staticmethod
+    def _task_to_key(task):
+        mode, spec = task
+        if mode == "ovo":
+            return tuple(spec)
+        if mode == "ovr":
+            return ("ovr", spec)
+        raise ValueError(f"Unsupported task mode: {mode}")
+
+    def _select_task_classes(self, X, Y, task):
+        mode, spec = task
+        if mode == "ovo":
+            c0, c1 = spec
+            return self._select_binary_classes(X, Y, c0, c1)
+        if mode == "ovr":
+            positive_class = spec
+            X = X.clone()
+            Y = Y.clone()
+            Y = (Y == positive_class).long()
+            return X, Y
+        raise ValueError(f"Unsupported task mode: {mode}")
+
     def _select_classes(self, X, Y, class_list):
         X = X.clone()
         Y = Y.clone()
@@ -1717,19 +1758,41 @@ class PTFCA:
         Y = Y[mask]
         return X, Y
 
-    def fit(self, TX, TY, max_windows=30, seed=0, verbose=True):
-        max_cls = int(max(TY) + 1)
+    def fit(self, TX, TY, max_windows=30, seed=0, verbose=True, mc_mode="ovo", class_list=None):
+        """
+        Fit the PTFCA window search over a multiclass problem.
+
+        mc_mode:
+            "ovo": one binary task per class pair, keys are (c0, c1) tuples.
+            "ovr": one binary task per class (class vs. the rest), keys are ("ovr", c) tuples.
+        class_list:
+            [..., ci, ...] Pre-selected (original) class labels to fit on.
+                - Labels are remapped to 0, 1, ... in the returned details_dict.
+                None: class_list = [0, 1, ..., TY.amax()]
+
+        The default mc_mode="ovo" with class_list=None reproduces the binary behaviour
+        of previous versions: keys (c0, c1) valid for the fitted classes.
+        """
+        class_list = self._get_class_list(TY, class_list)
+        selected_class_list = list(class_list)
+        TX, TY = self._select_classes(TX, TY, class_list)
+        class_list = list(range(len(class_list)))
+        tasks = self._get_multiclass_tasks(class_list, mc_mode)
         details_dict = {
             "info": {
                 "max_windows": max_windows,
                 "seed": seed,
+                "mc_mode": self._normalize_mc_mode(mc_mode),
+                "class_list": class_list,
+                "selected_class_list": selected_class_list,
             }
         }
-        for c0, c1 in itertools.combinations(range(max_cls), 2):
+        for task in tasks:
+            key = self._task_to_key(task)
             if verbose:
-                print("Fitting class: ", c0, c1)
-            _X, _Y = self._select_binary_classes(TX, TY, c0, c1)
-            details_dict[(c0, c1)] = self.fit_binary(_X, _Y, max_windows, seed, verbose)
+                print("Fitting task:", key)
+            _X, _Y = self._select_task_classes(TX, TY, task)
+            details_dict[key] = self.fit_binary(_X, _Y, max_windows, seed, verbose)
         return details_dict
 
     def extract_signal(self, OVO_state, TX, do_sum=True, max_wins=None):
@@ -1799,7 +1862,7 @@ class PTFCA:
 
         return EOs
 
-    def CSP_LDA_fit(self, details_dict, TX, TY, class_list=None):
+    def CSP_LDA_fit(self, details_dict, TX, TY, class_list=None, mc_mode=None):
         """
         A multi-class solution for calculating ALS.The CSP-LDA is fit across all O-V-O pairs;
             details_dict = self.fit(...)
@@ -1807,20 +1870,30 @@ class PTFCA:
             class_list: [..., ci, ...] Pre-selected classes.
                 - ci should in details_dict and TY.
                 None:  class_list = [0, 1, ..., TY.amax()]
+            mc_mode: "ovo" (class pairs) or "ovr" (one-vs-rest).
+                None: taken from details_dict["info"], defaulting to "ovo".
 
         return: List[List[state per window]]
         """
-        if class_list is None:
-            max_cls = int(max(TY) + 1)
-            class_list = list(range(max_cls))
-        class_tuple = list(itertools.combinations(class_list, 2))
-        states_OVO = []
-        for c0, c1 in class_tuple:
-            details = details_dict[(c0, c1)]
-            states = self.binary_CSP_LDA_fit(details, TX, TY, (c0, c1))
-            states_OVO.append(states)
+        if mc_mode is None:
+            mc_mode = details_dict.get("info", {}).get("mc_mode", "ovo")
+        class_list = self._get_class_list(TY, class_list)
+        cTX, cTY = self._select_classes(TX, TY, class_list)
+        class_list = list(range(len(class_list)))
+        tasks = self._get_multiclass_tasks(class_list, mc_mode)
+        states_mc = []
+        for task in tasks:
+            key = self._task_to_key(task)
+            details = details_dict[key]
+            mode, spec = task
+            if mode == "ovo":
+                states = self.binary_CSP_LDA_fit(details, cTX, cTY, spec)
+            else:
+                _X, _Y = self._select_task_classes(cTX, cTY, task)
+                states = self.binary_CSP_LDA_fit(details, _X, _Y)
+            states_mc.append(states)
 
-        return states_OVO
+        return states_mc
 
     def CSP_LDA_transform(self, states_OVO, EX, target="als"):
         """
@@ -1866,18 +1939,21 @@ class PTFCA:
         return svm.score(EF, EY)
 
     def NN_fit(self, details_dict, TX, TY, batch_size=32, n_s=32, dropout=0., max_clfnorm=0.5,
-               max_epoch=2000, lr0=0.0001, lr1=0.0001, seed=None, class_list=None, verbose=True):
+               max_epoch=2000, lr0=0.0001, lr1=0.0001, seed=None, class_list=None, verbose=True,
+               mc_mode=None):
 
-        if class_list is None:
-            max_cls = int(max(TY) + 1)
-            class_list = list(range(max_cls))
+        if mc_mode is None:
+            mc_mode = details_dict.get("info", {}).get("mc_mode", "ovo")
+        class_list = self._get_class_list(TY, class_list)
+        selected_class_list = list(class_list)
 
         cTX, cTY = self._select_classes(TX, TY, class_list)
-        class_tuple = list(itertools.combinations(class_list, 2))
+        class_list = list(range(len(class_list)))
+        tasks = self._get_multiclass_tasks(class_list, mc_mode)
         tfgs_list = []
         TC_OVO = []
-        for c0, c1 in class_tuple:
-            details = details_dict[(c0, c1)]
+        for task in tasks:
+            details = details_dict[self._task_to_key(task)]
             tfgs = [d['tfg'] for d in details]
             tfgs_list.append(tfgs)
             TC_OVO.append(self.get_tfcov_mean_lazyexact(tfgs, cTX, use_cache=False))
@@ -1892,7 +1968,11 @@ class PTFCA:
         if seed is not None:
             manual_seed(seed)
 
-        TDL.cuda()
+        device = cTX.device
+        if device.type == "cuda":
+            TDL.cuda(device)
+        else:
+            TDL.cpu()
         net_para = {
             "n_g": n_g,
             "n_cp": n_ovo,
@@ -1903,7 +1983,7 @@ class PTFCA:
             "max_clfnorm": max_clfnorm,
             "max_spnorm": 9999999.,
         }
-        net = MulticompNet(**net_para).cuda()
+        net = MulticompNet(**net_para).to(device)
 
         state_dict_list = []
         if not isinstance(max_epoch, Sequence):
@@ -1932,6 +2012,8 @@ class PTFCA:
                 "lr1": lr1,
             },
             "class_list": class_list,
+            "selected_class_list": selected_class_list,
+            "mc_mode": self._normalize_mc_mode(mc_mode),
             "tfgs_list": tfgs_list,
         }
         return states
